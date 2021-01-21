@@ -1,0 +1,189 @@
+---
+title: "Namibia FEWS Trade Indices"
+author: "Habib Khan"
+date: "1/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### What does the script do?
+*This script will use the R package "FEWS" developed by New Zealand Statistics, and call a few other functions to generate Fixed-effects Windows Splicing Trade Indices for Namibia data.*  
+
+
+**Required libararies**  
+We need packages "dplyr" for the data manipulation and "FEWS" for the indices calculation itself.  
+
+```{r, message=FALSE}
+library(dplyr)
+library(FEWS)
+```
+
+**Working directory**  
+Below code will set the working directory in the same location as this script is saved.  
+
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+**The data**  
+Namibia monthly exports and imports data for 2016-2020 was used to develop this script. The file is tab separated. All blank/null values will be read as NA.
+
+Please make sure that the data file is saved in the same folder as this script (working directory).
+
+```{r}
+df_orig = read.csv("NA_2016_2020.txt",
+                   sep = "\t",
+                   colClasses = c(rep("character", 2),
+                                  rep("NULL", 7),
+                                  rep("character", 2),
+                                  "NULL",
+                                  rep("character", 6),
+                                  rep("numeric", 2),
+                                  "character",
+                                  "numeric"),
+                   na.strings='NULL'
+                   )
+
+```
+
+The colClasses argument is set according to the data type of the varibles in the file. Namibia dataset has below variables:      
+1. `r colnames(df_orig[1])`: 4 digit year  
+2. `r colnames(df_orig[2])`: 2 digit month  
+3. `r colnames(df_orig[3])`: 10 digit trader ID  
+4. `r colnames(df_orig[4])`: Trader name  
+5. `r colnames(df_orig[5])`: Trade flow  
+6. `r colnames(df_orig[6])`: 8 digit HS code   
+7. `r colnames(df_orig[7])`: Commidity description  
+8. `r colnames(df_orig[8])`: Origin  
+9. `r colnames(df_orig[9])`: Destination  
+10. `r colnames(df_orig[10])`: Partner country  
+11. `r colnames(df_orig[11])`: Net weight  
+12. `r colnames(df_orig[12])`: Quantity  
+13. `r colnames(df_orig[13])`: Supplementary unit  
+14. `r colnames(df_orig[14])`: Trade value  
+
+If the list of variables or their order have changed, the script will fail or may produce erroneous result.  
+
+**Data cleaning**    
+We will exclude 0 and NA trade values and net weights beacuse those will result in invalid unit values. For that, we will first create a *not-in* operator and then use it to exclude records with 0 or NA trade values and/or net weights.
+
+A not-in operator can be created by negating "%in%" operator.  
+
+```{r}
+"%notin%" = Negate("%in%")
+df_orig = df_orig[df_orig$NetWeight %notin% c(0,NA) & df_orig$CValue %notin% c(0,NA), ]
+```
+
+**Subsetting**  
+Choose either Imports or Exports. Below code will subset for Exports. Put "I" instead of "E" if you want to subset for Imports.    
+  
+```{r}
+df = df_orig[df_orig$Flow=="E", ]
+```
+
+*NOTE: The dataframe may still be too large after subsetting, especially for Imports. For this reason or to calculate indices for a specific commodity group you may need to subset further for that commodity. You can use either of below codes for that purpose (replace 01, 0101, etc. with whichever commodity code you need):*  
+
+*1. For two digit level df = df[substr(df$HS, 1, 2) == "01", ]*  
+
+*2. For four digit level df = df[substr(df$HS, 1, 4) == "0101", ]*  
+
+*3. For six digit level df = df[substr(df$HS, 1, 6) == "010101", ]*  
+
+Now remove "df_orig" to save memory.  
+
+```{r}
+rm(df_orig)
+```
+
+**Data treatment**  
+Create an unit values columns.  
+
+```{r}
+df$UV = df$CValue/df$NetWeight
+```
+
+In the data file, the Year column has a strange name. We will change it to "Year". Then we will create a reference period column by combining Year and Month.
+
+```{r}
+names(df)[names(df)=="ï..Year"] = "Year"
+df$refPeriod = paste0(df$Year, df$Period)
+```
+
+Now we will remove unit values outliers. Below code will call a function saved the working directory which can remove outliers following Tukey's boxplot method.  
+
+```{r}
+source("Function_Outlier.R")
+```
+
+Running the function will generate a table with upper and lower bounds of unit values for each commodity. Any unit values outside this range will be considered outliers.  
+
+```{r}
+outliers = outlier(df, cmdCodeColname="HS", UV_Colname="UV", constant=1.5)
+```
+
+The argument "constant" can be used to change *tolerance* level for outlier. A smaller constant will mean that outlier treatment is more stringent and vice versa.   
+
+Now let's merge outliers table with the data and Remove records falling outside outlier ranges.  
+
+```{r}
+df = merge(df, outliers, by = "HS")
+
+df = df %>%
+  mutate(outlier_indicator= ifelse((df$UV>df$upper) | (df$UV<df$lower) , 1, 0))
+
+df = df[df$outlier_indicator == 0, ]
+```
+
+**Run FEWS**  
+FEWS require that the reference period column is numeric. So let's first ensure that.  
+```{r}
+df$refPeriod = as.numeric(df$refPeriod)
+```
+
+The main function in the FEWS package (also called FEWS) can be used to calculate the Indices. The two most important arguments in the function are *id* and *window_length*.  
+
+Ideally, id should be constructed by combining all variables that may influence unit values. Think of a regression model where the Y (dependent) variable is the unit values. All the X (independent) variables that may be *significant* in modelling Y should be combined together to get id.  
+
+In Namibia's case, these may be HS code, Trader ID and Partner country. Let's create some new variables combining two or more of these variables.  
+
+```{r}
+df$HS_Trader = paste(df$HS, df$Trader, sep = "_")
+df$HS_Partner = paste(df$HS, df$Partner, sep = "_")
+df$HS_Trader_Partner = paste(df$HS, df$Trader, df$Partner, sep = "_")
+```
+
+Now let's run the FEWS function. Below code uses the combination of HS, Trade and Partner as the unique ID and 16 months for window length (1 year and 1 quarter). Change these as you wish.  
+
+```{r, message=FALSE}
+OutputX_NA = FEWS(times = df$refPeriod,
+                  logprice = log(df$UV),
+                  id = df$HS_Trader_Partner,
+                  # **this is the most important argument
+                    # **ideally, the id column will be one which captures "quality"
+                    # **for NZ, it's created by combining HS, description, partner, and SU
+
+                  window_length = 16,
+                  # **number of periods during which the unique IDs will appear at least twice
+
+                  weight = df$UV*df$NetWeight,
+                  splice_pos = "mean",
+                  num_cores = NULL)
+```
+
+
+The output is a list where one of the elements is the indices. Let's extract that.  
+
+```{r}
+XMPI_NAX = OutputX_NA$fews
+```
+
+Now let's save the results to the working directory.  
+
+```{r}
+write.table(XMPI_NAX, "Results_FEWS_NA.txt", sep = "\t", row.names = FALSE)
+```
+
+**[End of script]**
